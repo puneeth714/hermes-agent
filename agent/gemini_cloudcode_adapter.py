@@ -28,9 +28,11 @@ reverse-engineered from the opencode-gemini-auth and clawdbot implementations.
 
 from __future__ import annotations
 
+import base64
 import json
 import logging
 import os
+import re
 import time
 import uuid
 from types import SimpleNamespace
@@ -78,11 +80,162 @@ def _coerce_content_to_text(content: Any) -> str:
             elif isinstance(p, dict):
                 if p.get("type") == "text" and isinstance(p.get("text"), str):
                     pieces.append(p["text"])
-                # Multimodal (image_url, etc.) — stub for now; log and skip
-                elif p.get("type") in ("image_url", "input_audio"):
-                    logger.debug("Dropping multimodal part (not yet supported): %s", p.get("type"))
         return "\n".join(pieces)
     return str(content)
+
+
+def _fetch_remote_asset(url: str) -> Optional[tuple[bytes, str]]:
+    """Fetch a remote image or audio asset and return (raw_bytes, mime_type)."""
+    if url.startswith("data:"):
+        try:
+            header, encoded = url.split(",", 1)
+            mime = header.split(":", 1)[1].split(";", 1)[0]
+            raw = base64.b64decode(encoded)
+            return raw, mime
+        except Exception:
+            return None
+
+    try:
+        # Use a reasonable timeout for fetching assets
+        with httpx.Client(timeout=10.0, follow_redirects=True) as client:
+            resp = client.get(url)
+            resp.raise_for_status()
+            raw = resp.content
+            mime = resp.headers.get("content-type", "application/octet-stream")
+            return raw, mime
+    except Exception as e:
+        logger.debug("Failed to fetch remote asset from %s: %s", url, e)
+        return None
+
+
+def _parse_placeholders_and_fetch(text: str) -> List[Dict[str, Any]]:
+    """Scan text for [User sent image/audio: path] placeholders and convert to inlineData.
+    Returns a list of parts (the cleaned text + any multimodal parts).
+    """
+    if not text:
+        return []
+
+    # Regexes for the placeholders injected by gateway/run.py
+    image_pattern = r"\[User sent an image: (.+?)\]"
+    audio_pattern = r"\[User sent audio: (.+?)\]"
+
+    image_paths = re.findall(image_pattern, text)
+    audio_paths = re.findall(audio_pattern, text)
+
+    # Clean the text by removing the placeholders to avoid confusing the model
+    # (since the actual data is now attached as native inlineData).
+    cleaned_text = re.sub(image_pattern, "", text)
+    cleaned_text = re.sub(audio_pattern, "", cleaned_text).strip()
+
+    parts = []
+    if cleaned_text:
+        parts.append({"text": cleaned_text})
+
+    for path in image_paths:
+        asset = _fetch_remote_asset(path)
+        if asset:
+            raw, mime = asset
+            parts.append(
+                {
+                    "inlineData": {
+                        "mimeType": mime,
+                        "data": base64.b64encode(raw).decode("ascii"),
+                    }
+                }
+            )
+
+    for path in audio_paths:
+        asset = _fetch_remote_asset(path)
+        if asset:
+            raw, mime = asset
+            parts.append(
+                {
+                    "inlineData": {
+                        "mimeType": mime,
+                        "data": base64.b64encode(raw).decode("ascii"),
+                    }
+                }
+            )
+
+    return parts
+
+
+def _extract_multimodal_parts(content: Any) -> List[Dict[str, Any]]:
+    """Convert OpenAI-style content parts to Gemini-native multimodal parts."""
+    if not isinstance(content, list):
+        text = _coerce_content_to_text(content)
+        return _parse_placeholders_and_fetch(text) if text else []
+
+    parts: List[Dict[str, Any]] = []
+    for item in content:
+        if isinstance(item, str):
+            parts.extend(_parse_placeholders_and_fetch(item))
+            continue
+        if not isinstance(item, dict):
+            continue
+        ptype = item.get("type")
+        if ptype == "text":
+            text = item.get("text")
+            if isinstance(text, str) and text:
+                parts.extend(_parse_placeholders_and_fetch(text))
+        elif ptype == "image_url":
+            image_value = item.get("image_url")
+            url = ""
+            if isinstance(image_value, dict):
+                url = str(image_value.get("url") or "")
+            elif isinstance(image_value, str):
+                url = image_value
+
+            if not url:
+                continue
+
+            asset = _fetch_remote_asset(url)
+            if asset:
+                raw, mime = asset
+                parts.append(
+                    {
+                        "inlineData": {
+                            "mimeType": mime,
+                            "data": base64.b64encode(raw).decode("ascii"),
+                        }
+                    }
+                )
+        elif ptype == "input_audio":
+            audio_value = item.get("input_audio") or {}
+            data = audio_value.get("data")
+            fmt = audio_value.get("format") or "wav"
+            if data:
+                parts.append(
+                    {
+                        "inlineData": {
+                            "mimeType": f"audio/{fmt}",
+                            "data": data,
+                        }
+                    }
+                )
+        elif ptype == "audio_url":
+            audio_value = item.get("audio_url")
+            url = ""
+            if isinstance(audio_value, dict):
+                url = str(audio_value.get("url") or "")
+            elif isinstance(audio_value, str):
+                url = audio_value
+
+            if not url:
+                continue
+
+            asset = _fetch_remote_asset(url)
+            if asset:
+                raw, mime = asset
+                parts.append(
+                    {
+                        "inlineData": {
+                            "mimeType": mime,
+                            "data": base64.b64encode(raw).decode("ascii"),
+                        }
+                    }
+                )
+    return parts
 
 
 def _translate_tool_call_to_gemini(tool_call: Dict[str, Any]) -> Dict[str, Any]:
@@ -159,9 +312,8 @@ def _build_gemini_contents(
         gemini_role = _ROLE_MAP_OPENAI_TO_GEMINI.get(role, "user")
         parts: List[Dict[str, Any]] = []
 
-        text = _coerce_content_to_text(msg.get("content"))
-        if text:
-            parts.append({"text": text})
+        content_parts = _extract_multimodal_parts(msg.get("content"))
+        parts.extend(content_parts)
 
         # Assistant messages can carry tool_calls
         tool_calls = msg.get("tool_calls") or []

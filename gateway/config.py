@@ -248,6 +248,10 @@ class GatewayConfig:
     # STT settings
     stt_enabled: bool = True  # Whether to auto-transcribe inbound voice messages
 
+    # Multimodal settings: auto (detect), native (force inline), or external (force tools)
+    multimodal_vision: str = "auto"
+    multimodal_audio: str = "auto"
+
     # Session isolation in shared chats
     group_sessions_per_user: bool = True  # Isolate group/channel sessions per participant when user IDs are available
     thread_sessions_per_user: bool = False  # When False (default), threads are shared across all participants
@@ -437,6 +441,8 @@ class GatewayConfig:
             sessions_dir=sessions_dir,
             always_log_local=data.get("always_log_local", True),
             stt_enabled=_coerce_bool(stt_enabled, True),
+            multimodal_vision=data.get("multimodal_vision", "auto"),
+            multimodal_audio=data.get("multimodal_audio", "auto"),
             group_sessions_per_user=_coerce_bool(group_sessions_per_user, True),
             thread_sessions_per_user=_coerce_bool(thread_sessions_per_user, False),
             unauthorized_dm_behavior=unauthorized_dm_behavior,

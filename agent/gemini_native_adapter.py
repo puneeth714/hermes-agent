@@ -20,6 +20,7 @@ import asyncio
 import base64
 import json
 import logging
+import re
 import time
 import uuid
 from types import SimpleNamespace
@@ -83,15 +84,39 @@ def _coerce_content_to_text(content: Any) -> str:
     return str(content)
 
 
+def _fetch_remote_asset(url: str) -> Optional[tuple[bytes, str]]:
+    """Fetch a remote image or audio asset and return (raw_bytes, mime_type)."""
+    if url.startswith("data:"):
+        try:
+            header, encoded = url.split(",", 1)
+            mime = header.split(":", 1)[1].split(";", 1)[0]
+            raw = base64.b64decode(encoded)
+            return raw, mime
+        except Exception:
+            return None
+
+    try:
+        # Use a reasonable timeout for fetching assets
+        with httpx.Client(timeout=10.0, follow_redirects=True) as client:
+            resp = client.get(url)
+            resp.raise_for_status()
+            raw = resp.content
+            mime = resp.headers.get("content-type", "application/octet-stream")
+            return raw, mime
+    except Exception as e:
+        logger.debug("Failed to fetch remote asset from %s: %s", url, e)
+        return None
+
+
 def _extract_multimodal_parts(content: Any) -> List[Dict[str, Any]]:
     if not isinstance(content, list):
         text = _coerce_content_to_text(content)
-        return [{"text": text}] if text else []
+        return _parse_placeholders_and_fetch(text) if text else []
 
     parts: List[Dict[str, Any]] = []
     for item in content:
         if isinstance(item, str):
-            parts.append({"text": item})
+            parts.extend(_parse_placeholders_and_fetch(item))
             continue
         if not isinstance(item, dict):
             continue
@@ -99,17 +124,94 @@ def _extract_multimodal_parts(content: Any) -> List[Dict[str, Any]]:
         if ptype == "text":
             text = item.get("text")
             if isinstance(text, str) and text:
-                parts.append({"text": text})
+                parts.extend(_parse_placeholders_and_fetch(text))
         elif ptype == "image_url":
-            url = ((item.get("image_url") or {}).get("url") or "")
-            if not isinstance(url, str) or not url.startswith("data:"):
+            image_value = item.get("image_url")
+            url = ""
+            if isinstance(image_value, dict):
+                url = str(image_value.get("url") or "")
+            elif isinstance(image_value, str):
+                url = image_value
+
+            if not url:
                 continue
-            try:
-                header, encoded = url.split(",", 1)
-                mime = header.split(":", 1)[1].split(";", 1)[0]
-                raw = base64.b64decode(encoded)
-            except Exception:
+
+            asset = _fetch_remote_asset(url)
+            if asset:
+                raw, mime = asset
+                parts.append(
+                    {
+                        "inlineData": {
+                            "mimeType": mime,
+                            "data": base64.b64encode(raw).decode("ascii"),
+                        }
+                    }
+                )
+        elif ptype == "input_audio":
+            audio_value = item.get("input_audio") or {}
+            data = audio_value.get("data")
+            fmt = audio_value.get("format") or "wav"
+            if data:
+                parts.append(
+                    {
+                        "inlineData": {
+                            "mimeType": f"audio/{fmt}",
+                            "data": data,
+                        }
+                    }
+                )
+        elif ptype == "audio_url":
+            audio_value = item.get("audio_url")
+            url = ""
+            if isinstance(audio_value, dict):
+                url = str(audio_value.get("url") or "")
+            elif isinstance(audio_value, str):
+                url = audio_value
+
+            if not url:
                 continue
+
+            asset = _fetch_remote_asset(url)
+            if asset:
+                raw, mime = asset
+                parts.append(
+                    {
+                        "inlineData": {
+                            "mimeType": mime,
+                            "data": base64.b64encode(raw).decode("ascii"),
+                        }
+                    }
+                )
+    return parts
+
+
+def _parse_placeholders_and_fetch(text: str) -> List[Dict[str, Any]]:
+    """Scan text for [User sent image/audio: path] placeholders and convert to inlineData.
+    Returns a list of parts (the cleaned text + any multimodal parts).
+    """
+    if not text:
+        return []
+
+    # Regexes for the placeholders injected by gateway/run.py
+    image_pattern = r"\[User sent an image: (.+?)\]"
+    audio_pattern = r"\[User sent audio: (.+?)\]"
+
+    image_paths = re.findall(image_pattern, text)
+    audio_paths = re.findall(audio_pattern, text)
+
+    # Clean the text by removing the placeholders to avoid confusing the model
+    # (since the actual data is now attached as native inlineData).
+    cleaned_text = re.sub(image_pattern, "", text)
+    cleaned_text = re.sub(audio_pattern, "", cleaned_text).strip()
+
+    parts = []
+    if cleaned_text:
+        parts.append({"text": cleaned_text})
+
+    for path in image_paths:
+        asset = _fetch_remote_asset(path)
+        if asset:
+            raw, mime = asset
             parts.append(
                 {
                     "inlineData": {
@@ -118,6 +220,20 @@ def _extract_multimodal_parts(content: Any) -> List[Dict[str, Any]]:
                     }
                 }
             )
+
+    for path in audio_paths:
+        asset = _fetch_remote_asset(path)
+        if asset:
+            raw, mime = asset
+            parts.append(
+                {
+                    "inlineData": {
+                        "mimeType": mime,
+                        "data": base64.b64encode(raw).decode("ascii"),
+                    }
+                }
+            )
+
     return parts
 
 

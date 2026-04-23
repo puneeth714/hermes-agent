@@ -483,6 +483,22 @@ skills:
   #   - ~/.agents/skills
   #   - /home/shared/team-skills
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Multimodal (Modality) Preferences
+# ─────────────────────────────────────────────────────────────────────────────
+# Control how Hermes processes user-attached images and audio/voice.
+# Options for multimodal_vision and multimodal_audio:
+#   "auto"     - Use native LLM modalities if the current model supports them,
+#                otherwise fall back to external analysis tools. (Default)
+#   "native"   - Force native LLM modality (send raw bytes/base64 to the model).
+#                Only works if the provider/model supports it.
+#   "external" - Force external analysis (run vision_analyze or STT tool
+#                locally and send the resulting text description to the LLM).
+#                Works for all models, even non-multimodal ones.
+#
+multimodal_vision: "auto"
+multimodal_audio: "auto"
+
 # =============================================================================
 # Agent Behavior
 # =============================================================================

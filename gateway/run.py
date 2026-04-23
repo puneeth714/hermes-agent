@@ -31,6 +31,8 @@ from datetime import datetime
 from typing import Dict, Optional, Any, List
 
 from agent.account_usage import fetch_account_usage, render_account_usage_lines
+from agent.models_dev import get_model_info
+
 
 # --- Agent cache tuning ---------------------------------------------------
 # Bounds the per-session AIAgent cache to prevent unbounded growth in
@@ -3105,6 +3107,7 @@ class GatewayRunner:
         7. Return response
         """
         source = event.source
+        user_config = _load_gateway_config()
 
         # Internal events (e.g. background-process completion notifications)
         # are system-generated and must skip user authorization.
@@ -3831,7 +3834,7 @@ class GatewayRunner:
         _run_generation = self._begin_session_run_generation(_quick_key)
 
         try:
-            return await self._handle_message_with_agent(event, source, _quick_key, _run_generation)
+            return await self._handle_message_with_agent(event, source, _quick_key, _run_generation, user_config=user_config)
         finally:
             # If _run_agent replaced the sentinel with a real agent and
             # then cleaned it up, this is a no-op.  If we exited early
@@ -3852,6 +3855,8 @@ class GatewayRunner:
         event: MessageEvent,
         source: SessionSource,
         history: List[Dict[str, Any]],
+        provider: Optional[str] = None,
+        model: Optional[str] = None,
     ) -> Optional[str]:
         """Prepare inbound event text for the agent.
 
@@ -3884,12 +3889,16 @@ class GatewayRunner:
                 message_text = await self._enrich_message_with_vision(
                     message_text,
                     image_paths,
+                    provider=provider,
+                    model=model,
                 )
 
             if audio_paths:
                 message_text = await self._enrich_message_with_transcription(
                     message_text,
                     audio_paths,
+                    provider=provider,
+                    model=model,
                 )
                 _stt_fail_markers = (
                     "No STT provider",
@@ -4436,22 +4445,30 @@ class GatewayRunner:
                 if vc_context:
                     context_prompt += f"\n\n{vc_context}"
 
+        # Resolve model/provider early so multimodal enrichment knows the capabilities
+        _early_model = None
+        _early_provider = None
+        try:
+            _user_config = _load_gateway_config()
+            _m, _r = self._resolve_session_agent_runtime(
+                source=source,
+                session_key=session_key,
+                user_config=_user_config,
+            )
+            _early_model = _m
+            _early_provider = _r.get("provider")
+        except Exception:
+            pass
+
         # -----------------------------------------------------------------
-        # Auto-analyze images sent by the user
-        #
-        # If the user attached image(s), we run the vision tool eagerly so
-        # the conversation model always receives a text description.  The
-        # local file path is also included so the model can re-examine the
-        # image later with a more targeted question via vision_analyze.
-        #
-        # We filter to image paths only (by media_type) so that non-image
-        # attachments (documents, audio, etc.) are not sent to the vision
-        # tool even when they appear in the same message.
+        # Auto-analyze images/audio sent by the user
         # -----------------------------------------------------------------
         message_text = await self._prepare_inbound_message_text(
             event=event,
             source=source,
             history=history,
+            provider=_early_provider,
+            model=_early_model,
         )
         if message_text is None:
             return
@@ -8201,23 +8218,48 @@ class GatewayRunner:
         self,
         user_text: str,
         image_paths: List[str],
+        provider: Optional[str] = None,
+        model: Optional[str] = None,
     ) -> str:
         """
         Auto-analyze user-attached images with the vision tool and prepend
         the descriptions to the message text.
 
-        Each image is analyzed with a general-purpose prompt.  The resulting
-        description *and* the local cache path are injected so the model can:
-          1. Immediately understand what the user sent (no extra tool call).
-          2. Re-examine the image with vision_analyze if it needs more detail.
-
-        Args:
-            user_text:   The user's original caption / message text.
-            image_paths: List of local file paths to cached images.
-
-        Returns:
-            The enriched message string with vision descriptions prepended.
+        If the current model supports vision natively (and multimodal_vision is
+        set to 'auto' or 'native'), we skip external analysis and instead
+        inject a placeholder that the Gemini/multimodal adapters will pick up.
         """
+        use_native = False
+        mode = getattr(self.config, "multimodal_vision", "auto")
+
+        if mode == "native":
+            use_native = True
+        elif mode == "auto" and (provider or model):
+            try:
+                # Resolve effective model info for capability check
+                from agent.models_dev import get_model_info
+                model_info = get_model_info(provider, model)
+                if model_info and model_info.supports_vision():
+                    use_native = True
+                else:
+                    # Fallback: if provider is 'gemini' or 'google-gemini-cli', assume native vision support
+                    # as these are the primary multimodal providers.
+                    _p = str(provider or "").lower()
+                    if "gemini" in _p or "google" in _p:
+                        use_native = True
+            except Exception as e:
+                logger.debug("Failed to check vision support for %s/%s: %s", provider, model, e)
+
+        if use_native:
+            placeholders = []
+            for path in image_paths:
+                placeholders.append(f"[User sent an image: {path}]")
+
+            prefix = "\n\n".join(placeholders)
+            if user_text:
+                return f"{prefix}\n\n{user_text}"
+            return prefix
+
         from tools.vision_tools import vision_analyze_tool
 
         analysis_prompt = (
@@ -8268,18 +8310,46 @@ class GatewayRunner:
         self,
         user_text: str,
         audio_paths: List[str],
+        provider: Optional[str] = None,
+        model: Optional[str] = None,
     ) -> str:
         """
         Auto-transcribe user voice/audio messages using the configured STT provider
         and prepend the transcript to the message text.
 
-        Args:
-            user_text:   The user's original caption / message text.
-            audio_paths: List of local file paths to cached audio files.
-
-        Returns:
-            The enriched message string with transcriptions prepended.
+        If the current model supports audio natively (and multimodal_audio is
+        set to 'auto' or 'native'), we skip external transcription and instead
+        inject a placeholder that the Gemini/multimodal adapters will pick up.
         """
+        use_native = False
+        mode = getattr(self.config, "multimodal_audio", "auto")
+
+        if mode == "native":
+            use_native = True
+        elif mode == "auto" and (provider or model):
+            try:
+                from agent.models_dev import get_model_info
+                model_info = get_model_info(provider, model)
+                if model_info and model_info.supports_audio_input():
+                    use_native = True
+                else:
+                    # Fallback for known multimodal providers
+                    _p = str(provider or "").lower()
+                    if "gemini" in _p or "google" in _p:
+                        use_native = True
+            except Exception as e:
+                logger.debug("Failed to check audio support for %s/%s: %s", provider, model, e)
+
+        if use_native:
+            placeholders = []
+            for path in audio_paths:
+                placeholders.append(f"[User sent audio: {path}]")
+
+            prefix = "\n\n".join(placeholders)
+            if user_text:
+                return f"{prefix}\n\n{user_text}"
+            return prefix
+
         if not getattr(self.config, "stt_enabled", True):
             disabled_note = "[The user sent voice message(s), but transcription is disabled in config."
             if self._has_setup_skill():
@@ -10737,6 +10807,8 @@ class GatewayRunner:
                         event=pending_event,
                         source=next_source,
                         history=updated_history,
+                        # Model/provider info not easily available on background path,
+                        # will default to external enrichment.
                     )
                     if next_message is None:
                         return result
